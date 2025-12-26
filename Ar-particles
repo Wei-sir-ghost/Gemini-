@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Gemini Particle WebAR System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        #canvas-container { position: relative; width: 100vw; height: 100vh; }
+        video { transform: scaleX(-1); display: none; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        #ui { position: fixed; top: 20px; left: 20px; color: #0ff; z-index: 10; pointer-events: none; text-shadow: 0 0 5px #0ff; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <h2>Gemini AI Particle System</h2>
+        <div id="gesture-name">检测中...</div>
+    </div>
+    <div id="canvas-container">
+        <video id="input-video"></video>
+    </div>
+
+    <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+    <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script>
+        /** --- 配置与核心变量 --- **/
+        const PARTICLE_COUNT = 16000;
+        const videoElement = document.getElementById('input-video');
+        const gestureText = document.getElementById('gesture-name');
+        
+        let scene, camera, renderer, particles;
+        let handPrevPos = new THREE.Vector3();
+        let handVelocity = 0;
+        let currentGesture = 0; // 0:Circle, 1:Text, 2:Fist(Sphere), 3:Star, 4:Heart
+        let targetTransition = 0;
+        let explosionFactor = 0;
+
+        /** --- 顶点着色器：核心物理引擎 --- **/
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uTransition;
+            uniform float uExplosion;
+            uniform vec3 uHandPos;
+            uniform float uHandSpeed;
+            uniform float uScale;
+
+            attribute vec3 targetPos;
+            attribute vec3 nextTargetPos;
+            attribute float pId;
+
+            varying float vDistance;
+
+            // 伪随机函数
+            float hash(float n) { return fract(sin(n) * 43758.5453123); }
+
+            void main() {
+                // 基础插值：从当前形态到下一形态
+                vec3 basePos = mix(targetPos, nextTargetPos, uTransition);
+                
+                // 物理模型：增加基于ID的随机扰动（模拟流体感）
+                float noise = hash(pId);
+                basePos.x += sin(uTime * 2.0 + pId) * 0.1;
+                basePos.y += cos(uTime * 2.1 + pId) * 0.1;
+
+                // 爆炸特效逻辑
+                vec3 explosionDir = normalize(basePos) * uExplosion * noise * 15.0;
+                vec3 pos = basePos + explosionDir;
+
+                // 挥手风暴：检测与手部位置的距离
+                float distToHand = distance(pos * uScale, uHandPos);
+                vDistance = distToHand;
+                
+                if(distToHand < 3.0) {
+                    // 计算排斥力（加速度模型）
+                    vec3 forceDir = normalize(pos * uScale - uHandPos);
+                    float strength = (3.0 - distToHand) * uHandSpeed * 0.5;
+                    pos += forceDir * strength;
+                }
+
+                // 深度推拉缩放
+                vec4 mvPosition = modelViewMatrix * vec4(pos * uScale, 1.0);
+                gl_PointSize = (20.0 / -mvPosition.z) * (1.0 + noise);
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            varying float vDistance;
+            void main() {
+                float d = distance(gl_PointCoord, vec2(0.5));
+                if(d > 0.5) discard;
+                
+                // 颜色：青色(Cyan)流体感，受交互距离影响
+                vec3 color = vec3(0.0, 1.0, 1.0);
+                float glow = 0.1 / d;
+                gl_FragColor = vec4(color * glow, 0.8);
+            }
+        `;
+
+        /** --- 形状生成器 --- **/
+        const ShapeGen = {
+            circle: (i) => {
+                const angle = (i / PARTICLE_COUNT) * Math.PI * 2;
+                return new THREE.Vector3(Math.cos(angle) * 5, Math.sin(angle) * 5, 0);
+            },
+            sphere: (i) => {
+                const phi = Math.acos(-1 + (2 * i) / PARTICLE_COUNT);
+                const theta = Math.sqrt(PARTICLE_COUNT * Math.PI) * phi;
+                return new THREE.Vector3(
+                    5 * Math.cos(theta) * Math.sin(phi),
+                    5 * Math.sin(theta) * Math.sin(phi),
+                    5 * Math.cos(phi)
+                );
+            },
+            star: (i) => {
+                const angle = (i / PARTICLE_COUNT) * Math.PI * 2;
+                const r = 5 * (i % 2 === 0 ? 1 : 0.4);
+                const starAngle = Math.floor(i / (PARTICLE_COUNT/5)) * (Math.PI*2/5);
+                const localAngle = (i / (PARTICLE_COUNT/5)) * (Math.PI*2/5);
+                const rad = 3 + 2 * Math.cos(localAngle * 5.0);
+                return new THREE.Vector3(Math.cos(angle) * rad, Math.sin(angle) * rad, 0);
+            },
+            heart: (i) => {
+                const t = (i / PARTICLE_COUNT) * Math.PI * 2;
+                // 心形参数方程
+                const x = 16 * Math.pow(Math.sin(t), 3);
+                const y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                return new THREE.Vector3(x * 0.3, y * 0.3, 0);
+            },
+            text: (str, centerStr = "") => {
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = 1024; canvas.height = 512;
+                ctx.fillStyle = 'white';
+                ctx.font = 'bold 120px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(str, 512, 256);
+                if(centerStr) {
+                    ctx.font = 'bold 80px Arial';
+                    ctx.fillText(centerStr, 512, 360);
+                }
+                
+                const imgData = ctx.getImageData(0,0,1024,512).data;
+                const pts = [];
+                for(let i=0; i<imgData.length; i+=40) { // 采样
+                    if(imgData[i] > 128) {
+                        const px = (i/4) % 1024;
+                        const py = Math.floor((i/4) / 1024);
+                        pts.push(new THREE.Vector3((px-512)*0.03, (256-py)*0.03, 0));
+                    }
+                }
+                return pts;
+            }
+        };
+
+        /** --- 初始化场景 --- **/
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.z = 15;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            // 准备粒子数据
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const pIds = new Float32Array(PARTICLE_COUNT);
+            
+            // 预设五个状态的顶点数据
+            const states = [
+                Array.from({length: PARTICLE_COUNT}, (_, i) => ShapeGen.circle(i)),
+                fillToCount(ShapeGen.text("This is Gemini")),
+                Array.from({length: PARTICLE_COUNT}, (_, i) => ShapeGen.sphere(i)),
+                Array.from({length: PARTICLE_COUNT}, (_, i) => ShapeGen.star(i)),
+                fillToCount(ShapeGen.text("Gemini", "♥")) 
+            ];
+
+            function fillToCount(pts) {
+                const res = [];
+                for(let i=0; i<PARTICLE_COUNT; i++) {
+                    res.push(pts[i % pts.length].clone().addScalar(Math.random()*0.1));
+                }
+                return res;
+            }
+
+            const targetPosAttrib = new THREE.BufferAttribute(new Float32Array(PARTICLE_COUNT * 3), 3);
+            const nextTargetPosAttrib = new THREE.BufferAttribute(new Float32Array(PARTICLE_COUNT * 3), 3);
+
+            for(let i=0; i<PARTICLE_COUNT; i++) {
+                pIds[i] = i;
+                const p = states[0][i];
+                positions[i*3] = p.x; positions[i*3+1] = p.y; positions[i*3+2] = p.z;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('pId', new THREE.BufferAttribute(pIds, 1));
+            geometry.setAttribute('targetPos', targetPosAttrib);
+            geometry.setAttribute('nextTargetPos', nextTargetPosAttrib);
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 },
+                    uTransition: { value: 0 },
+                    uExplosion: { value: 0 },
+                    uHandPos: { value: new THREE.Vector3() },
+                    uHandSpeed: { value: 0 },
+                    uScale: { value: 1.0 }
+                },
+                vertexShader,
+                fragmentShader,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+
+            window.statesData = states;
+            updateAttributes(0, 0);
+        }
+
+        function updateAttributes(cur, next) {
+            const tAttr = particles.geometry.attributes.targetPos;
+            const nAttr = particles.geometry.attributes.nextTargetPos;
+            for(let i=0; i<PARTICLE_COUNT; i++) {
+                const p1 = window.statesData[cur][i];
+                const p2 = window.statesData[next][i];
+                tAttr.setXYZ(i, p1.x, p1.y, p1.z);
+                nAttr.setXYZ(i, p2.x, p2.y, p2.z);
+            }
+            tAttr.needsUpdate = true;
+            nAttr.needsUpdate = true;
+        }
+
+        /** --- MediaPipe 手势识别逻辑 --- **/
+        const hands = new Hands({
+            locateFile: (file) => `https://unpkg.com/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults((results) => {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // 1. 位置转换 (MediaPipe 0-1 空间 -> Three.js 世界空间)
+                const palm = landmarks[9];
+                const targetX = (0.5 - palm.x) * 20;
+                const targetY = (0.5 - palm.y) * 15;
+                const handPos = new THREE.Vector3(targetX, targetY, 0);
+                
+                // 2. 挥手速度计算
+                handVelocity = handPos.distanceTo(handPrevPos) * 10;
+                handPrevPos.copy(handPos);
+                particles.material.uniforms.uHandPos.value.lerp(handPos, 0.2);
+                particles.material.uniforms.uHandSpeed.value = THREE.MathUtils.lerp(particles.material.uniforms.uHandSpeed.value, handVelocity, 0.1);
+
+                // 3. 深度推拉 (基于手掌大小 0号点到5号点的距离)
+                const dx = landmarks[0].x - landmarks[5].x;
+                const dy = landmarks[0].y - landmarks[5].y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                const scale = THREE.MathUtils.mapLinear(dist, 0.1, 0.4, 0.5, 2.5);
+                particles.material.uniforms.uScale.value = THREE.MathUtils.lerp(particles.material.uniforms.uScale.value, scale, 0.1);
+
+                // 4. 手势状态机
+                detectGesture(landmarks);
+            }
+        });
+
+        function detectGesture(lm) {
+            const getUp = (i) => lm[i].y < lm[i-2].y;
+            const isThumbUp = lm[4].y < lm[3].y && lm[4].y < lm[2].y && lm[4].x < lm[2].x; // 简化版
+            const upCount = [8, 12, 16, 20].filter(getUp).length;
+
+            let newGesture = currentGesture;
+            let name = "";
+
+            if (upCount >= 4) { newGesture = 0; name = "🖐️ Open Palm: Circle"; }
+            else if (upCount === 2 && getUp(8) && getUp(12)) { newGesture = 1; name = "✌️ Scissors: Gemini Text"; }
+            else if (upCount === 0 && !isThumbUp) { newGesture = 2; name = "✊ Fist: Sphere"; }
+            else if (upCount === 1 && getUp(8)) { newGesture = 3; name = "☝️ Index: Star"; }
+            else if (lm[4].y < lm[2].y && upCount === 0) { newGesture = 4; name = "👍 Thumbs Up: Heart"; }
+
+            if(newGesture !== currentGesture) {
+                triggerExplosion(currentGesture, newGesture);
+                currentGesture = newGesture;
+                gestureText.innerText = name;
+            }
+        }
+
+        function triggerExplosion(cur, next) {
+            targetTransition = 0;
+            explosionFactor = 1.0;
+            updateAttributes(cur, next);
+        }
+
+        /** --- 动画循环 --- **/
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = performance.now() * 0.001;
+            particles.material.uniforms.uTime.value = time;
+
+            // 平滑过渡
+            if (targetTransition < 1.0) {
+                targetTransition += 0.02;
+                particles.material.uniforms.uTransition.value = targetTransition;
+            }
+            
+            // 爆炸衰减
+            if (explosionFactor > 0) {
+                explosionFactor *= 0.92;
+                particles.material.uniforms.uExplosion.value = explosionFactor;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        const cameraFeed = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({ image: videoElement }); },
+            width: 1280, height: 720
+        });
+
+        init();
+        cameraFeed.start();
+        animate();
+
+        // 响应式调整
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
