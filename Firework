@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebAR 手势粒子互动系统 - 2025</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        #video-container { position: fixed; width: 100%; height: 100%; z-index: -1; transform: scaleX(-1); }
+        video { width: 100%; height: 100%; object-fit: cover; opacity: 0.4; }
+        canvas#three-canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+        #ui { position: fixed; top: 20px; left: 20px; color: #fff; text-shadow: 0 0 5px #000; }
+        .loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; }
+    </style>
+</head>
+<body>
+    <div id="ui">手势识别中... (尝试：张手、剪刀手、握拳、食指、大拇指)</div>
+    <div id="video-container"><video id="input-video" playsinline></video></div>
+    <canvas id="three-canvas"></canvas>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { Hands } from 'https://unpkg.com/@mediapipe/hands/hands.js';
+        import { Camera } from 'https://unpkg.com/@mediapipe/camera_utils/camera_utils.js';
+
+        // --- 配置参数 ---
+        const PARTICLE_COUNT = 16000;
+        const STATE = { IDLE: 0, FIREWORK: 1, TEXT_CN: 2, VORTEX: 3, STAR: 4, TEXT_EN: 5 };
+        let currentState = STATE.IDLE;
+        
+        // --- 核心变量 ---
+        let scene, camera, renderer, particles, geometry;
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const velocities = new Float32Array(PARTICLE_COUNT * 3);
+        const targets = new Float32Array(PARTICLE_COUNT * 3);
+        const colors = new Float32Array(PARTICLE_COUNT * 3);
+        
+        const videoElement = document.getElementById('input-video');
+        const uiElement = document.getElementById('ui');
+
+        // --- 辅助功能：文字点阵采样 ---
+        function getPixelTargets(text, fontSize, width, height) {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = width; canvas.height = height;
+            ctx.fillStyle = 'white';
+            ctx.font = `bold ${fontSize}px "Microsoft YaHei", sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, width / 2, height / 2);
+            
+            const imageData = ctx.getImageData(0, 0, width, height).data;
+            const points = [];
+            for (let y = 0; y < height; y += 2) {
+                for (let x = 0; x < width; x += 2) {
+                    if (imageData[(y * width + x) * 4] > 128) {
+                        points.push({ x: (x - width / 2) * 0.05, y: -(y - height / 2) * 0.05 });
+                    }
+                }
+            }
+            return points;
+        }
+
+        const textPointsCN = getPixelTargets("新年快乐", 120, 600, 300);
+        const textPointsEN = getPixelTargets("Happy New Year", 80, 800, 300);
+
+        // --- 初始化场景 ---
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 15;
+
+            renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('three-canvas'), alpha: true, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+
+            geometry = new THREE.BufferGeometry();
+            const colorObj = new THREE.Color();
+            
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                positions[i*3] = (Math.random() - 0.5) * 50;
+                positions[i*3+1] = (Math.random() - 0.5) * 50;
+                positions[i*3+2] = (Math.random() - 0.5) * 50;
+                
+                targets.set([positions[i*3], positions[i*3+1], positions[i*3+2]], i*3);
+                
+                colorObj.setHSL(Math.random(), 0.8, 0.6);
+                colors[i*3] = colorObj.r;
+                colors[i*3+1] = colorObj.g;
+                colors[i*3+2] = colorObj.b;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const material = new THREE.PointsMaterial({
+                size: 0.08,
+                vertexColors: true,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+
+        // --- 手势识别逻辑 ---
+        function detectGesture(landmarks) {
+            const getDist = (a, b) => Math.hypot(landmarks[a].x - landmarks[b].x, landmarks[a].y - landmarks[b].y);
+            
+            const isFingerUp = (tip, pip) => landmarks[tip].y < landmarks[pip].y;
+            const thumbUp = landmarks[4].x < landmarks[3].x; // 简化版大拇指
+            const indexUp = isFingerUp(8, 6);
+            const middleUp = isFingerUp(12, 10);
+            const ringUp = isFingerUp(16, 14);
+            const pinkyUp = isFingerUp(20, 18);
+
+            // 1. 张手 (FIREWORK)
+            if (indexUp && middleUp && ringUp && pinkyUp) return STATE.FIREWORK;
+            // 2. 剪刀手 (TEXT_CN)
+            if (indexUp && middleUp && !ringUp && !pinkyUp) return STATE.TEXT_CN;
+            // 3. 握拳 (VORTEX)
+            if (!indexUp && !middleUp && !ringUp && !pinkyUp && !thumbUp) return STATE.VORTEX;
+            // 4. 食指 (STAR)
+            if (indexUp && !middleUp && !ringUp && !pinkyUp) return STATE.STAR;
+            // 5. 大拇指 (TEXT_EN)
+            if (thumbUp && !indexUp && !middleUp) return STATE.TEXT_EN;
+
+            return STATE.IDLE;
+        }
+
+        // --- 物理更新逻辑 ---
+        function updatePhysics(handCenter, depthScale) {
+            const time = Date.now() * 0.001;
+            const posAttr = geometry.attributes.position;
+            
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+                let tx = targets[i3], ty = targets[i3+1], tz = targets[i3+2];
+
+                // 根据状态改变 Target
+                if (currentState === STATE.FIREWORK) {
+                    const angle = i * 0.137 + time;
+                    const r = 5 + Math.sin(time * 2 + i) * 2;
+                    tx = handCenter.x + Math.cos(angle) * r * Math.cos(i);
+                    ty = handCenter.y + Math.sin(angle) * r;
+                    tz = Math.sin(i) * r;
+                } else if (currentState === STATE.VORTEX) {
+                    const r = 3 + Math.sin(i * 0.01) * 2;
+                    tx = handCenter.x + Math.cos(i * 0.1 + time * 5) * r;
+                    ty = handCenter.y + Math.sin(i * 0.1 + time * 5) * r;
+                    tz = Math.sin(time + i) * 2;
+                } else if (currentState === STATE.STAR) {
+                    const outerR = 6, innerR = 3;
+                    const rot = i % 5 * (Math.PI * 2 / 5) + time;
+                    const r = (i % 2 === 0) ? outerR : innerR;
+                    tx = handCenter.x + Math.cos(rot) * r;
+                    ty = handCenter.y + Math.sin(rot) * r;
+                    tz = 0;
+                } else if (currentState === STATE.TEXT_CN || currentState === STATE.TEXT_EN) {
+                    const pts = (currentState === STATE.TEXT_CN) ? textPointsCN : textPointsEN;
+                    const p = pts[i % pts.length];
+                    tx = handCenter.x + p.x;
+                    ty = handCenter.y + p.y;
+                    tz = 0;
+                } else {
+                    tx += Math.sin(time + i) * 0.01;
+                    ty += Math.cos(time + i) * 0.01;
+                }
+
+                // 核心物理公式: v = v + (target - pos) * stiffness; pos = pos + v;
+                const stiffness = 0.05, damping = 0.85;
+                velocities[i3] = (velocities[i3] + (tx - positions[i3]) * stiffness) * damping;
+                velocities[i3+1] = (velocities[i3+1] + (ty - positions[i3+1]) * stiffness) * damping;
+                velocities[i3+2] = (velocities[i3+2] + (tz - positions[i3+2]) * stiffness) * damping;
+
+                positions[i3] += velocities[i3];
+                positions[i3+1] += velocities[i3+1];
+                positions[i3+2] += velocities[i3+2];
+            }
+            
+            // 深度推拉反馈
+            particles.scale.setScalar(THREE.MathUtils.lerp(particles.scale.x, 0.5 + depthScale * 2, 0.1));
+            posAttr.needsUpdate = true;
+        }
+
+        // --- MediaPipe 设置 ---
+        const hands = new Hands({
+            locateFile: (file) => `https://unpkg.com/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults((results) => {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                currentState = detectGesture(landmarks);
+                
+                // 转换坐标系: MediaPipe (0~1) to Three.js (-10~10)
+                const center = {
+                    x: -(landmarks[9].x - 0.5) * 30, // 翻转水平轴以匹配镜像视频
+                    y: -(landmarks[9].y - 0.5) * 20
+                };
+                
+                // 计算深度（手掌跨度）
+                const dx = landmarks[0].x - landmarks[12].x;
+                const dy = landmarks[0].y - landmarks[12].y;
+                const handSize = Math.sqrt(dx*dx + dy*dy);
+                
+                updatePhysics(center, handSize);
+                uiElement.innerText = `当前手势: ${Object.keys(STATE)[currentState]}`;
+            } else {
+                currentState = STATE.IDLE;
+                updatePhysics({x: 0, y: 0}, 0.2);
+            }
+        });
+
+        const cameraFeed = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({ image: videoElement }); },
+            width: 1280, height: 720
+        });
+
+        // --- 循环渲染 ---
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // 启动
+        initThree();
+        cameraFeed.start();
+        animate();
+    </script>
+</body>
+</html>
